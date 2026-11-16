@@ -5,15 +5,20 @@ import numpy as np
 import plotly.graph_objects as go
 
 # Konfigurasi Halaman
-st.set_page_config(page_title="SMC Trading & Backtest Dashboard", layout="wide")
-st.title("Smart Money Concepts (SMC) — Analisa & Backtest")
-st.caption("Deteksi Fair Value Gap (FVG), Level Entry/SL/TP Otomatis, dan Simulasi Ekuitas")
+st.set_page_config(page_title="SMC Pro Multi-Timeframe Dashboard", layout="wide")
+st.title("Smart Money Concepts (SMC) — Analisa & Multi-Timeframe Backtest")
+st.caption("Deteksi FVG Signifikan + Filter Tren EMA 200 + Eksekusi Pending Limit Order (Retest)")
 
 # Sidebar Parameter
 st.sidebar.header("Pengaturan Aset & Strategi")
 ticker = st.sidebar.text_input("Simbol Ticker (Yahoo Finance)", value="BTC-USD", help="Contoh: BBCA.JK, EURUSD=X, GC=F, BTC-USD")
-period = st.sidebar.selectbox("Rentang Data Historis", options=["3mo", "6mo", "1y", "2y"], index=1)
-interval = st.sidebar.selectbox("Timeframe", options=["1h", "4h", "1d"], index=2)
+period = st.sidebar.selectbox("Rentang Data Historis (Chart Utama)", options=["6mo", "1y", "2y", "5y"], index=2)
+interval = st.sidebar.selectbox("Timeframe Chart Utama", options=["1h", "4h", "1d"], index=2)
+
+st.sidebar.subheader("Filter Kualitas SMC")
+use_ema_filter = st.sidebar.checkbox("Aktifkan Filter Tren (EMA 200)", value=True)
+min_fvg_atr = st.sidebar.slider("Lebar Minimum FVG (x ATR)", min_value=0.0, max_value=1.0, value=0.25, step=0.05)
+order_expiry = st.sidebar.slider("Batas Waktu Tunggu Retest (Candle)", min_value=3, max_value=20, value=8, step=1)
 
 st.sidebar.subheader("Manajemen Risiko & Modal")
 initial_capital = st.sidebar.number_input("Modal Awal ($ / Rp)", min_value=100.0, value=10000.0, step=500.0)
@@ -30,32 +35,50 @@ def load_data(symbol, per, inter):
     df.dropna(inplace=True)
     return df
 
-# Fungsi Logika SMC (FVG & Sinyal Entry/SL/TP)
-def run_smc_strategy(df, capital, risk_pct, rr, fee):
+# Fungsi Logika SMC (FVG + EMA 200 + Retest Limit Order)
+def run_smc_strategy(df, capital, risk_pct, rr, fee, ema_filter, min_gap_mult, expiry_bars):
     data = df.copy()
     
-    # Identifikasi Bullish & Bearish Fair Value Gap (FVG)
-    data['Bull_FVG'] = (data['Low'] > data['High'].shift(2)) & (data['Close'].shift(1) > data['Open'].shift(1))
-    data['Bear_FVG'] = (data['High'] < data['Low'].shift(2)) & (data['Close'].shift(1) < data['Open'].shift(1))
+    # Hitung Indikator Pendukung: EMA 200 & ATR 14
+    data['EMA_200'] = data['Close'].ewm(span=200, adjust=False).mean()
     
-    # ATR untuk penyangga Stop Loss
     high_low = data['High'] - data['Low']
     high_close = np.abs(data['High'] - data['Close'].shift())
     low_close = np.abs(data['Low'] - data['Close'].shift())
     tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
     data['ATR'] = tr.rolling(14).mean()
 
+    # Hitung Celah FVG (Fair Value Gap)
+    bull_gap = data['Low'] - data['High'].shift(2)
+    bear_gap = data['Low'].shift(2) - data['High']
+
+    # Kondisi FVG Valid (Struktur 3 Candle + Lebar Minimum ATR)
+    raw_bull_fvg = (bull_gap > (data['ATR'] * min_gap_mult)) & (data['Close'].shift(1) > data['Open'].shift(1))
+    raw_bear_fvg = (bear_gap > (data['ATR'] * min_gap_mult)) & (data['Close'].shift(1) < data['Open'].shift(1))
+
+    # Terapkan Filter Tren EMA 200 jika diaktifkan
+    if ema_filter:
+        data['Bull_FVG'] = raw_bull_fvg & (data['Close'] > data['EMA_200'])
+        data['Bear_FVG'] = raw_bear_fvg & (data['Close'] < data['EMA_200'])
+    else:
+        data['Bull_FVG'] = raw_bull_fvg
+        data['Bear_FVG'] = raw_bear_fvg
+
     trades = []
     equity = capital
     equity_curve = [capital] * len(data)
+    
     active_trade = None
+    pending_order = None
     latest_setup = None
 
-    for i in range(15, len(data)):
+    start_idx = 200 if ema_filter else 15
+
+    for i in range(start_idx, len(data)):
         row = data.iloc[i]
         idx = data.index[i]
 
-        # Cek apakah posisi aktif menyentuh SL atau TP
+        # 1. Cek Posisi Aktif (SL / TP)
         if active_trade is not None:
             if active_trade['type'] == 'LONG':
                 if row['Low'] <= active_trade['sl']:
@@ -80,109 +103,30 @@ def run_smc_strategy(df, capital, risk_pct, rr, fee):
                     trades.append({**active_trade, 'exit_date': idx, 'exit_price': active_trade['tp'], 'result': 'WIN', 'pnl': pnl})
                     active_trade = None
 
-        # Buka sinyal baru jika tidak ada posisi aktif
-        if active_trade is None and not np.isnan(row['ATR']):
+        # 2. Cek Pending Limit Order (Menunggu Harga Retest Area FVG)
+        if active_trade is None and pending_order is not None:
+            bars_waited = i - pending_order['created_bar']
+            
+            if bars_waited > expiry_bars:
+                pending_order = None
+            elif pending_order['type'] == 'LONG':
+                if row['Low'] <= pending_order['sl']:
+                    pending_order = None
+                elif row['Low'] <= pending_order['entry']:
+                    active_trade = pending_order.copy()
+                    active_trade['entry_date'] = idx
+                    pending_order = None
+            elif pending_order['type'] == 'SHORT':
+                if row['High'] >= pending_order['sl']:
+                    pending_order = None
+                elif row['High'] >= pending_order['entry']:
+                    active_trade = pending_order.copy()
+                    active_trade['entry_date'] = idx
+                    pending_order = None
+
+        # 3. Buat Pending Order Baru jika Muncul FVG Valid
+        if active_trade is None and pending_order is None and not np.isnan(row['ATR']):
             if row['Bull_FVG']:
-                entry = row['Close']
-                sl = data['Low'].iloc[i-2:i+1].min() - (0.2 * row['ATR'])
-                risk_dist = entry - sl
-                if risk_dist > 0:
-                    tp = entry + (risk_dist * rr)
-                    risk_amt = equity * (risk_pct / 100.0)
-                    pos_size = risk_amt / risk_dist
-                    fee_cost = (pos_size * entry) * (fee / 100.0) * 2
-                    active_trade = {
-                        'type': 'LONG', 'entry_date': idx, 'entry': entry,
-                        'sl': sl, 'tp': tp, 'risk_amount': risk_amt, 'fee_cost': fee_cost
-                    }
-                    latest_setup = active_trade.copy()
-
-            elif row['Bear_FVG']:
-                entry = row['Close']
-                sl = data['High'].iloc[i-2:i+1].max() + (0.2 * row['ATR'])
-                risk_dist = sl - entry
-                if risk_dist > 0:
-                    tp = entry - (risk_dist * rr)
-                    risk_amt = equity * (risk_pct / 100.0)
-                    pos_size = risk_amt / risk_dist
-                    fee_cost = (pos_size * entry) * (fee / 100.0) * 2
-                    active_trade = {
-                        'type': 'SHORT', 'entry_date': idx, 'entry': entry,
-                        'sl': sl, 'tp': tp, 'risk_amount': risk_amt, 'fee_cost': fee_cost
-                    }
-                    latest_setup = active_trade.copy()
-
-        equity_curve[i] = equity
-
-    data['Equity'] = equity_curve
-    return data, pd.DataFrame(trades), latest_setup
-
-# Eksekusi Utama
-df_raw = load_data(ticker, period, interval)
-
-if df_raw.empty:
-    st.error("Data tidak ditemukan. Periksa kembali simbol ticker Anda (contoh: BBCA.JK atau BTC-USD).")
-else:
-    df_res, trades_df, last_setup = run_smc_strategy(df_raw, initial_capital, risk_per_trade, rr_ratio, fee_pct)
-
-    # Kartu Metrik Backtest
-    final_equity = df_res['Equity'].iloc[-1]
-    net_return_pct = ((final_equity - initial_capital) / initial_capital) * 100
-    total_trades = len(trades_df)
-    win_rate = (len(trades_df[trades_df['result'] == 'WIN']) / total_trades * 100) if total_trades > 0 else 0.0
-    
-    # Hitung Maximum Drawdown
-    rolling_max = df_res['Equity'].cummax()
-    drawdown = (df_res['Equity'] - rolling_max) / rolling_max * 100
-    max_dd = drawdown.min()
-
-    col1, col2, col3, col4 = st.columns(4)
-    col1.metric("Ekuitas Akhir", f"{final_equity:,.2f}", f"{net_return_pct:+.2f}%")
-    col2.metric("Total Transaksi", f"{total_trades}x")
-    col3.metric("Win Rate", f"{win_rate:.1f}%")
-    col4.metric("Max Drawdown", f"{max_dd:.2f}%")
-
-    # Grafik Candlestick + Garis Entry, SL, TP Terakhir
-    st.subheader(f"Grafik Harga & Setup SMC Terakhir ({ticker})")
-    fig = go.Figure(data=[go.Candlestick(
-        x=df_res.index,
-        open=df_res['Open'],
-        high=df_res['High'],
-        low=df_res['Low'],
-        close=df_res['Close'],
-        name="Harga"
-    )])
-
-    # Tandai Sinyal FVG
-    bull_signals = df_res[df_res['Bull_FVG']]
-    bear_signals = df_res[df_res['Bear_FVG']]
-    fig.add_trace(go.Scatter(x=bull_signals.index, y=bull_signals['Low'] * 0.995, mode='markers',
-                             marker=dict(symbol='triangle-up', size=9, color='#00C853'), name='Bullish FVG'))
-    fig.add_trace(go.Scatter(x=bear_signals.index, y=bear_signals['High'] * 1.005, mode='markers',
-                             marker=dict(symbol='triangle-down', size=9, color='#FF1744'), name='Bearish FVG'))
-
-    # Tambahkan Garis Horizontal Otomatis untuk Entry, SL, dan TP dari Setup Terakhir
-    if last_setup is not None:
-        fig.add_hline(y=last_setup['entry'], line_dash="solid", line_color="#2979FF",
-                      annotation_text=f"ENTRY ({last_setup['type']}): {last_setup['entry']:,.2f}", annotation_position="top left")
-        fig.add_hline(y=last_setup['sl'], line_dash="dash", line_color="#FF1744",
-                      annotation_text=f"STOP LOSS: {last_setup['sl']:,.2f}", annotation_position="bottom left")
-        fig.add_hline(y=last_setup['tp'], line_dash="dash", line_color="#00C853",
-                      annotation_text=f"TAKE PROFIT: {last_setup['tp']:,.2f}", annotation_position="top left")
-
-    fig.update_layout(height=520, xaxis_rangeslider_visible=False, template="plotly_dark", margin=dict(l=10, r=10, t=30, b=10))
-    st.plotly_chart(fig, use_container_width=True)
-
-    # Grafik Kurva Ekuitas & Tabel Riwayat
-    col_eq, col_tbl = st.columns([1.2, 1])
-    with col_eq:
-        st.subheader("Kurva Pertumbuhan Modal (Equity Curve)")
-        fig_eq = go.Figure(go.Scatter(x=df_res.index, y=df_res['Equity'], mode='lines', line=dict(color='#00E676', width=2), name='Ekuitas'))
-        fig_eq.update_layout(height=320, template="plotly_dark", margin=dict(l=10, r=10, t=20, b=10))
-        st.plotly_chart(fig_eq, use_container_width=True)
-
-    with col_tbl:
-        st.subheader("Riwayat Transaksi Backtest")
-        if not trades_df.empty:
-            display_df = trades_df[['type', 'entry_date', 'entry', 'sl', 'tp', 'result', 'pnl']].copy()
-            st.dataframe(display_df.tail(15), use_container_width=True, height=320)
+                entry_price = row['Low']
+                sl_price = data['Low'].iloc[i-2] - (0.2 * row['ATR'])
+                risk_dist = entry_price - sl
